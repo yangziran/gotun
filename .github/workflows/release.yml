@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*' # 当推送以 v 开头的 tag 时触发 (例如 v1.0.0)
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }} for ${{ matrix.goarch }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+            artifact_name: gotun_darwin_amd64
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            artifact_name: gotun_darwin_arm64
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            artifact_name: gotun_linux_amd64
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            artifact_name: gotun_windows_amd64.exe
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Build
+        shell: bash
+        run: |
+          mkdir -p bin
+          # macOS 需要 CGO 以支持原生状态栏 (Systray/Cocoa)
+          # Linux 与 Windows 采用无头模式 (Headless)，关闭 CGO 产出纯静态二进制
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            export CGO_ENABLED=1
+          else
+            export CGO_ENABLED=0
+          fi
+          
+          export GOOS=${{ matrix.goos }}
+          export GOARCH=${{ matrix.goarch }}
+          
+          go build -trimpath -ldflags="-s -w" -o bin/${{ matrix.artifact_name }} ./cmd/gotun
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: bin/${{ matrix.artifact_name }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
