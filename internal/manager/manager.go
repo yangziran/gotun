@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/yangziran/gotun/internal/config"
+	"github.com/yangziran/gotun/internal/dns"
 	"github.com/yangziran/gotun/internal/metrics"
 	"github.com/yangziran/gotun/internal/pool"
 	"github.com/yangziran/gotun/internal/router"
@@ -22,6 +23,7 @@ type Manager struct {
 	tunnelConfigs map[string]config.TunnelConfig
 	pool          *pool.Pool
 	router        *router.Router
+	dnsSrv        *dns.Server
 	ctx           context.Context
 	cancel        context.CancelFunc
 }
@@ -43,6 +45,14 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.ctx, m.cancel = context.WithCancel(ctx)
 	m.pool = pool.NewPool(m.ctx)
 	m.router = router.NewRouter(m.ctx, m.cfg.Routing)
+
+	// 启动 DNS 服务器
+	if m.cfg.DNS.Enable {
+		m.dnsSrv = dns.NewServer(m.cfg.DNS, m.router)
+		if err := m.dnsSrv.Start(m.ctx); err != nil {
+			logger.Error("DNS 服务器启动失败", "err", err)
+		}
+	}
 
 	// 启动 Metrics (内部保证了 sync.Once，重复启动不会报错)
 	metrics.StartMetricsServer(m.cfg.MetricsAddr)
@@ -93,12 +103,27 @@ func (m *Manager) Reload(newCfg *config.Config) {
 	logger.Info("正在执行配置热加载 (Hot Reload)...")
 
 	oldRouting := m.cfg.Routing
+	oldDNS := m.cfg.DNS
 	m.cfg = newCfg
 	routingChanged := !reflect.DeepEqual(oldRouting, m.cfg.Routing)
+	dnsChanged := !reflect.DeepEqual(oldDNS, m.cfg.DNS)
 
 	metrics.StartMetricsServer(m.cfg.MetricsAddr)
 	if routingChanged {
 		m.router = router.NewRouter(m.ctx, m.cfg.Routing)
+	}
+
+	if dnsChanged || (routingChanged && m.cfg.DNS.Enable) {
+		if m.dnsSrv != nil {
+			m.dnsSrv.Stop()
+			m.dnsSrv = nil
+		}
+		if m.cfg.DNS.Enable {
+			m.dnsSrv = dns.NewServer(m.cfg.DNS, m.router)
+			if err := m.dnsSrv.Start(m.ctx); err != nil {
+				logger.Error("DNS 服务器热加载启动失败", "err", err)
+			}
+		}
 	}
 
 	// 1. 更新全局 Pool (自动复用未改变的连接，剔除被删除或已修改的连接)
@@ -122,7 +147,7 @@ func (m *Manager) Reload(newCfg *config.Config) {
 			oldTunCfg := m.tunnelConfigs[name]
 			// 如果各项核心参数不一致，或者路由配置发生变化且该隧道是 dynamic 类型，则重启
 			forceRestart := routingChanged && oldTunCfg.Type == "dynamic"
-			
+
 			if forceRestart ||
 				oldTunCfg.LocalAddr != newTunCfg.LocalAddr ||
 				oldTunCfg.RemoteAddr != newTunCfg.RemoteAddr ||
@@ -153,6 +178,10 @@ func (m *Manager) Stop() {
 	for name, t := range m.tunnels {
 		t.Stop()
 		delete(m.tunnels, name)
+	}
+
+	if m.dnsSrv != nil {
+		m.dnsSrv.Stop()
 	}
 
 	if m.pool != nil {

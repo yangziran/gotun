@@ -10,7 +10,7 @@
 - **开发语言**：Go 1.20+
 - **核心依赖**：`golang.org/x/crypto/ssh`, `github.com/spf13/cobra`, `github.com/kardianos/service`, `github.com/prometheus/client_golang`, `github.com/getlantern/systray`
 - **目标平台**：macOS / Linux / Windows
-- **核心定位**：一个轻量级、高可用、支持声明式配置的跨平台企业级 SSH 隧道与边缘网络网关工具。解决开发者日常工作中频繁维护 SSH 端口转发的痛点，提供零停机热加载、多路并发复用、内置智能分流路由以及极简原生桌面状态栏。
+- **核心定位**：一个轻量级、高可用、支持声明式配置的跨平台企业级 SSH 隧道与边缘网络网关工具。解决开发者日常工作中频繁维护 SSH 端口转发的痛点，提供零停机热加载、多路并发复用、内置智能分流路由、极速防污染 DNS 以及全链路双栈 IPv6 原生架构。
 
 ---
 
@@ -20,16 +20,48 @@
 
 系统采用自定向下的分层架构，底层网络与业务层完全解耦，确保代码的高内聚与低耦合。
 
-```text
-[ 表现层 ]  cmd/gotun (启动入口) ── internal/cli (Cobra解析、SIGHUP监听、系统守护进程)
-                 │
-[ 逻辑层 ]  internal/manager (全局调度与配置热加载 Reload) ── internal/metrics (Prometheus探针)
-                 │
-[ 路由层 ]  internal/tunnel (隧道业务: Local/Dynamic/Remote 分发、轮询负载均衡)
-                 │
-[ 连接层 ]  internal/pool (ServerPool: SSH连接池、多路复用、堡垒机ProxyJump、心跳重连)
-                 │
-[ 基础层 ]  internal/config (解析) ── pkg/logger (日志) ── pkg/crypto (AES-GCM 加解密)
+系统采用自定向下的分层架构，底层网络与业务层完全解耦，确保代码的高内聚与低耦合。
+
+```mermaid
+graph TD
+    %% 表现层
+    subgraph 表现层 [表现层 (Presentation Layer)]
+        A[cmd/gotun<br>启动入口] --> B[internal/cli<br>Cobra解析 / 守护进程 / 原生状态栏]
+    end
+
+    %% 逻辑层
+    subgraph 逻辑层 [逻辑层 (Logic Layer)]
+        B --> C[internal/manager<br>全局调度与 SIGHUP 热加载]
+        C -.-> D[internal/metrics<br>Prometheus 监控探针]
+        C --> E[internal/dns<br>智能防污染 DNS 与多策略协议]
+    end
+
+    %% 路由层
+    subgraph 路由层 [路由层 (Routing Layer)]
+        C --> F[internal/tunnel<br>隧道生命周期与多路复用调度]
+        F --> G1(Local Tunnel<br>本地端口转发)
+        F --> G2(Dynamic Tunnel<br>SOCKS5 / PAC 分流代理)
+        F --> G3(Remote Tunnel<br>反向内网穿透 / 容灾 HA)
+    end
+
+    %% 连接层
+    subgraph 连接层 [连接层 (Connection Layer)]
+        F --> H[internal/pool - ServerPool<br>并发 SSH 连接池 / 堡垒机穿透]
+    end
+
+    %% 基础层
+    subgraph 基础层 [基础层 (Infrastructure Layer)]
+        C -.-> I1[internal/config<br>YAML 配置解析]
+        C -.-> I2[pkg/logger<br>日志系统]
+        C -.-> I3[pkg/crypto<br>AES-GCM 加解密]
+    end
+
+    style A fill:#2B3A42,stroke:#3F5159,stroke-width:2px,color:#fff
+    style B fill:#3F5159,stroke:#2B3A42,stroke-width:2px,color:#fff
+    style C fill:#4CAF50,stroke:#388E3C,stroke-width:2px,color:#fff
+    style E fill:#00ACC1,stroke:#00838F,stroke-width:2px,color:#fff
+    style F fill:#F57C00,stroke:#E65100,stroke-width:2px,color:#fff
+    style H fill:#E53935,stroke:#C62828,stroke-width:2px,color:#fff
 ```
 
 ### 2.2 目录结构规范 (Standard Go Layout)
@@ -67,9 +99,16 @@ gotun/
 // internal/config/config.go
 type Config struct {
     Routing     RoutingConfig  `yaml:"routing,omitempty"`
+    DNS         DNSConfig      `yaml:"dns,omitempty"`
     Servers     []ServerConfig `yaml:"servers"`
     Tunnels     []TunnelConfig `yaml:"tunnels"`
     MetricsAddr string         `yaml:"metrics_addr,omitempty"`
+}
+
+type DNSConfig struct {
+    Enable     bool   `yaml:"enable"`
+    ListenAddr string `yaml:"listen_addr"`
+    Upstream   string `yaml:"upstream"`
 }
 
 type RoutingConfig struct {
@@ -151,6 +190,19 @@ gotun reload
 
 - **Metrics**：所有的流量与重连行为都在运行时通过 `Prometheus` 进行累加打点，支持对接企业级可视化大屏。
 
+### 4.5 极速 DNS 网关与国密 DoH (TLCP) 劫持
+
+借助 `miekg/dns`，Gotun 实现了一个透明的极速 DNS 缓存防污染代理：
+- **策略模式 (Strategy Pattern)**：在 `internal/dns/resolver.go` 中抽象了 `UpstreamResolver` 接口。根据配置前缀 (`udp://`, `tls://`, `https://`, `gmdoh://`)，动态初始化分发 UDP、DoT、DoH 解析器，实现开闭原则 (OCP)。
+- **国密 TLCP 劫持**：引入了开源的 `tjfoc/gmsm` 密码学库。对于 `gmdoh://` 协议，我们抛弃了 Go 官方的 `crypto/tls`，通过在 HTTP Transport 层劫持 `DialTLSContext`，手动调用 `gmtls.Client` 进行商密级 TLCP 双证书握手。实现了对业务层完全透明的国密 DoH 解析支持。
+- **AAAA 与 A 记录隔离缓存**：对收到的 DNS Msg 按照 `Name + Qtype + Qclass` 进行联合散列，自然隔离 IPv4 与 IPv6 缓存。
+
+### 4.6 全链路双栈 IPv6 原生兼容架构
+
+底层完全打破单栈绑定局限，实现企业级双栈兼容：
+- **智能双栈侦听**：对于 `local`、`dynamic` 隧道以及 DNS 网关，若用户配置了 `127.0.0.1:port` 或 `0.0.0.0:port`，底层的 `getDualStackAddrs` 函数会自动裂变产生 `[::1]:port` 和 `[::]:port`。程序会动态向内核申请多个并发监听器，自动适配系统级双栈网络。
+- **底层格式强约束**：所有的远端地址与动态寻址拼接，强制弃用 `fmt.Sprintf`，全面改为 `net.JoinHostPort`，完美处理纯 IPv6 (IPv6-Only) 宿主机的网络特征，消除 `too many colons` 崩溃。
+
 ---
 
 ## 五、 开发环境初始化指南
@@ -180,3 +232,8 @@ make clean         # 清理 bin 目录
   - **网络底层暴改**：强制关闭 Nagle 算法并注入 4MB 巨大 TCP 读写缓冲；引入 128KB 零拷贝 (Zero-Allocation) 内存池消除 GC 停顿。
   - **企业穿透与路由**：支持多跳链式堡垒机 (ProxyJump) 与多节点负载均衡容灾；内置 PAC 智能分流，毫秒级绕过国内 IP 与局域网。
   - **桌面与运维体系**：引入极简原生跨平台状态栏 (Systray)；支持跨进程 `SIGHUP` 零停机热加载；提供 Prometheus 探针与配置 AES 加密。
+
+- **[x] v1.1.0**：(极速双栈与防污染解析升级)
+  - **极速防污染 DNS**：内置基于 `miekg/dns` 的透明缓存解析器。使用 Strategy 模式原生支持 UDP、DoT、DoH 协议上游。
+  - **国密 TLCP 劫持**：引入 `tjfoc/gmsm`，在 HTTP 传输层接管握手，提供符合商密标准的国密 DoH 客户端能力。
+  - **全链路原生 IPv6**：底层弃用脆弱单栈监听，智能根据宿主机地址裂变并发侦听双栈端口。彻底根除因 `too many colons` 导致的 IPv6-Only 节点拨号崩溃。

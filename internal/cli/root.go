@@ -36,7 +36,7 @@ const usageTemplate = `使用方法:
 使用 "{{.CommandPath}} [command] --help" 获取有关某个命令的详细信息。
 `
 
-// Execute is the main entry point for the CLI
+// Execute 是 CLI 命令行交互界面的主入口点
 func Execute() {
 	rootCmd.SetUsageTemplate(usageTemplate)
 	rootCmd.CompletionOptions.DisableDefaultCmd = true

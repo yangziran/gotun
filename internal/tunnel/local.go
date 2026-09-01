@@ -12,6 +12,7 @@ import (
 	"github.com/yangziran/gotun/internal/metrics"
 	"github.com/yangziran/gotun/internal/pool"
 	"github.com/yangziran/gotun/pkg/logger"
+	"github.com/yangziran/gotun/pkg/utils"
 )
 
 // LocalTunnel 实现了本地端口转发隧道 (类似 ssh -L)
@@ -19,12 +20,12 @@ type LocalTunnel struct {
 	cfg  config.TunnelConfig
 	pool *pool.Pool
 
-	ln      net.Listener // 本地持久化监听器
-	wg      sync.WaitGroup
-	ctx     context.Context
-	cancel  context.CancelFunc
-	running bool
-	mu      sync.Mutex
+	listeners []net.Listener // 本地持久化监听器列表
+	wg        sync.WaitGroup
+	ctx       context.Context
+	cancel    context.CancelFunc
+	running   bool
+	mu        sync.Mutex
 
 	robinIndex uint64
 }
@@ -55,24 +56,34 @@ func (t *LocalTunnel) Start(ctx context.Context) error {
 
 	logger.Info("正在启动本地转发隧道...", "tunnel", t.cfg.Name)
 
-	ln, err := net.Listen("tcp", t.cfg.LocalAddr)
-	if err != nil {
-		return fmt.Errorf("listen on local address %s failed: %w", t.cfg.LocalAddr, err)
+	addrs := utils.GetDualStackAddrs(t.cfg.LocalAddr)
+	for _, addr := range addrs {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			logger.Warn("双栈监听失败 (可能不支持IPv6，将忽略)", "tunnel", t.cfg.Name, "addr", addr, "err", err)
+			continue
+		}
+		t.listeners = append(t.listeners, ln)
+		logger.Info("本地端口正在监听，将转发至远端", "tunnel", t.cfg.Name, "local", addr, "remote", t.cfg.RemoteAddr, "servers", t.cfg.ServerNames)
 	}
-	t.ln = ln
-	logger.Info("本地端口正在监听，将转发至远端", "tunnel", t.cfg.Name, "local", t.cfg.LocalAddr, "remote", t.cfg.RemoteAddr, "servers", t.cfg.ServerNames)
 
-	t.wg.Add(1)
-	go t.acceptLoop()
+	if len(t.listeners) == 0 {
+		return fmt.Errorf("listen on local addresses failed for tunnel %s", t.cfg.Name)
+	}
+
+	for _, ln := range t.listeners {
+		t.wg.Add(1)
+		go t.acceptLoop(ln)
+	}
 
 	return nil
 }
 
 // acceptLoop 接收本地连接
-func (t *LocalTunnel) acceptLoop() {
+func (t *LocalTunnel) acceptLoop(ln net.Listener) {
 	defer t.wg.Done()
 	for {
-		localConn, err := t.ln.Accept()
+		localConn, err := ln.Accept()
 		if err != nil {
 			select {
 			case <-t.ctx.Done():
@@ -159,8 +170,8 @@ func (t *LocalTunnel) Stop() {
 	t.mu.Unlock()
 
 	logger.Info("正在停止隧道...", "tunnel", t.cfg.Name)
-	if t.ln != nil {
-		t.ln.Close()
+	for _, ln := range t.listeners {
+		ln.Close()
 	}
 
 	go func() {

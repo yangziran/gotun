@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,8 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+// Client 封装了单个靶机的 SSH 物理连接生命周期。
+// 它内置了心跳保持、状态监控与断线自动退避重连机制，确保隧道持久不死。
 type Client struct {
 	srvCfg config.ServerConfig
 	pool   *Pool
@@ -141,7 +144,7 @@ func (c *Client) dial() (*ssh.Client, error) {
 		sshConfig.Auth = append(sshConfig.Auth, ssh.Password(c.srvCfg.Password))
 	}
 
-	targetAddr := fmt.Sprintf("%s:%d", c.srvCfg.Host, c.srvCfg.Port)
+	targetAddr := net.JoinHostPort(c.srvCfg.Host, strconv.Itoa(c.srvCfg.Port))
 
 	// 链式代理穿透 (ProxyJump)
 	if c.srvCfg.JumpHost != "" {

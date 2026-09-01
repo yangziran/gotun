@@ -10,6 +10,8 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+// ServerGroup 维护了通向同一个目标宿主机的多条并发 SSH 连接 (Client)。
+// 用于解决跨国高延迟(LFN)情况下的单通道 TCP 队头阻塞问题。
 type ServerGroup struct {
 	cfg     config.ServerConfig
 	clients []*Client
@@ -42,6 +44,8 @@ func (sg *ServerGroup) GetSSHClient(ctx context.Context) (*ssh.Client, error) {
 	return sg.clients[idx].GetSSHClient(ctx)
 }
 
+// Pool 是全局隧道连接池核心组件，负责集中管理、调度与复用所有节点的物理 SSH 链路。
+// 它解耦了业务隧道与底层网络，实现了多隧道对底层连接的高效复用。
 type Pool struct {
 	mu      sync.RWMutex
 	servers map[string]*ServerGroup
@@ -49,6 +53,7 @@ type Pool struct {
 	cancel  context.CancelFunc
 }
 
+// NewPool 创建并初始化一个受 Context 生命周期控制的全局 SSH 连接池。
 func NewPool(ctx context.Context) *Pool {
 	p := &Pool{
 		servers: make(map[string]*ServerGroup),

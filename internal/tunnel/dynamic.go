@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/yangziran/gotun/internal/pool"
 	"github.com/yangziran/gotun/internal/router"
 	"github.com/yangziran/gotun/pkg/logger"
+	"github.com/yangziran/gotun/pkg/utils"
 )
 
 // DynamicTunnel 实现了基于 SOCKS5 协议的动态端口转发隧道 (类似 ssh -D)
@@ -23,12 +25,12 @@ type DynamicTunnel struct {
 	pool   *pool.Pool
 	router *router.Router
 
-	ln      net.Listener // 本地 SOCKS5 代理监听器
-	wg      sync.WaitGroup
-	ctx     context.Context
-	cancel  context.CancelFunc
-	running bool
-	mu      sync.Mutex
+	listeners []net.Listener // 本地 SOCKS5 代理监听器列表
+	wg        sync.WaitGroup
+	ctx       context.Context
+	cancel    context.CancelFunc
+	running   bool
+	mu        sync.Mutex
 
 	robinIndex uint64
 }
@@ -60,24 +62,34 @@ func (t *DynamicTunnel) Start(ctx context.Context) error {
 
 	logger.Info("正在启动动态 SOCKS5 代理...", "tunnel", t.cfg.Name)
 
-	ln, err := net.Listen("tcp", t.cfg.LocalAddr)
-	if err != nil {
-		return fmt.Errorf("listen on local address %s failed: %w", t.cfg.LocalAddr, err)
+	addrs := utils.GetDualStackAddrs(t.cfg.LocalAddr)
+	for _, addr := range addrs {
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			logger.Warn("双栈监听失败 (可能不支持IPv6，将忽略)", "tunnel", t.cfg.Name, "addr", addr, "err", err)
+			continue
+		}
+		t.listeners = append(t.listeners, ln)
+		logger.Info("本地 SOCKS5 代理正在监听", "tunnel", t.cfg.Name, "local", addr, "servers", t.cfg.ServerNames)
 	}
-	t.ln = ln
-	logger.Info("本地 SOCKS5 代理正在监听", "tunnel", t.cfg.Name, "local", t.cfg.LocalAddr, "servers", t.cfg.ServerNames)
 
-	t.wg.Add(1)
-	go t.acceptLoop()
+	if len(t.listeners) == 0 {
+		return fmt.Errorf("listen on local addresses failed for tunnel %s", t.cfg.Name)
+	}
+
+	for _, ln := range t.listeners {
+		t.wg.Add(1)
+		go t.acceptLoop(ln)
+	}
 
 	return nil
 }
 
 // acceptLoop 接收 SOCKS5 客户端的连接请求
-func (t *DynamicTunnel) acceptLoop() {
+func (t *DynamicTunnel) acceptLoop(ln net.Listener) {
 	defer t.wg.Done()
 	for {
-		localConn, err := t.ln.Accept()
+		localConn, err := ln.Accept()
 		if err != nil {
 			select {
 			case <-t.ctx.Done():
@@ -125,7 +137,7 @@ func (t *DynamicTunnel) handleConnection(localConn net.Conn) {
 	defer metrics.ActiveConnections.WithLabelValues(t.cfg.Name, t.cfg.Type).Dec()
 
 	var remoteConn net.Conn
-	
+
 	if t.router != nil && !t.router.ShouldProxy(host) {
 		logger.Debug("SOCKS5 命中直连规则", "tunnel", t.cfg.Name, "target", targetAddr)
 		remoteConn, err = net.Dial("tcp", targetAddr)
@@ -257,7 +269,7 @@ func (t *DynamicTunnel) socks5Request(conn net.Conn) (string, error) {
 	}
 	port := binary.BigEndian.Uint16(buf[:2])
 
-	return fmt.Sprintf("%s:%d", host, port), nil
+	return net.JoinHostPort(host, strconv.Itoa(int(port))), nil
 }
 
 // Stop 终止并清理动态隧道资源
@@ -274,8 +286,8 @@ func (t *DynamicTunnel) Stop() {
 	t.mu.Unlock()
 
 	logger.Info("正在停止动态隧道...", "tunnel", t.cfg.Name)
-	if t.ln != nil {
-		t.ln.Close()
+	for _, ln := range t.listeners {
+		ln.Close()
 	}
 
 	go func() {

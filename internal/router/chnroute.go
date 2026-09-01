@@ -19,6 +19,7 @@ type Chnroutes struct {
 	prefixes []netip.Prefix
 }
 
+// NewChnroutes 实例化并返回一个并发安全的国内 IP 分流路由表引擎
 func NewChnroutes() *Chnroutes {
 	return &Chnroutes{
 		prefixes: make([]netip.Prefix, 0),

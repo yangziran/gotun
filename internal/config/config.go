@@ -12,8 +12,16 @@ import (
 type Config struct {
 	Servers     []ServerConfig `yaml:"servers"`
 	Tunnels     []TunnelConfig `yaml:"tunnels"`
-	Routing     RoutingConfig  `yaml:"routing,omitempty"` // 智能路由引擎配置
+	Routing     RoutingConfig  `yaml:"routing,omitempty"`      // 智能路由引擎配置
 	MetricsAddr string         `yaml:"metrics_addr,omitempty"` // Prometheus 指标监听地址，例如 "127.0.0.1:9090"
+	DNS         DNSConfig      `yaml:"dns,omitempty"`          // DNS 缓存与代理功能配置
+}
+
+// DNSConfig 代表 DNS 服务器相关的配置
+type DNSConfig struct {
+	Enable     bool   `yaml:"enable"`
+	ListenAddr string `yaml:"listen_addr"`
+	Upstream   string `yaml:"upstream"`
 }
 
 // RoutingConfig 代表智能路由的配置
