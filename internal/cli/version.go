@@ -6,7 +6,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var Version = "v1.0.0"
+// Version 为发布版本号。发布 CI 通过 -ldflags "-X github.com/yangziran/gotun/internal/cli.Version=<tag>"
+// 注入对应 tag；本地开发构建无注入时显示 "dev"。
+var Version = "dev"
 
 var versionCmd = &cobra.Command{
 	Use:   "version",

@@ -3,6 +3,7 @@ package dns
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/miekg/dns"
 	"github.com/tjfoc/gmsm/gmtls"
+	gmx509 "github.com/tjfoc/gmsm/x509"
 )
 
 // UpstreamResolver 定义了 DNS 向上游请求解析的统一接口规范。
@@ -111,9 +113,18 @@ type gmDohResolver struct {
 	client *http.Client
 }
 
+// newGmDohResolver 创建国密 DoH 解析器。
+// TLCP 握手由 gmsm/gmtls 完成，但证书链与主机名校验委托给标准库 crypto/x509：
+// gmsm/x509 只能从 Linux 文件路径加载系统根（macOS/Windows 上返回空池），
+// 而标准库系统根跨平台可靠（macOS 走平台校验器，实测见 PLAN.md 阶段 B 记录）。
+// 任何校验失败都会拒绝连接，不存在静默跳过验证的路径。
 func newGmDohResolver(url string) (*gmDohResolver, error) {
-	gmConfig := &gmtls.Config{
-		InsecureSkipVerify: true, // 默认跳过证书校验，若需严格校验可配置根证书池
+	stdRoots, err := x509.SystemCertPool()
+	if err != nil {
+		return nil, fmt.Errorf("国密 DoH: 加载系统根证书失败: %w", err)
+	}
+	if stdRoots == nil {
+		return nil, fmt.Errorf("国密 DoH: 系统根证书不可用")
 	}
 
 	transport := &http.Transport{
@@ -123,9 +134,15 @@ func newGmDohResolver(url string) (*gmDohResolver, error) {
 				return nil, err
 			}
 			host, _, _ := net.SplitHostPort(addr)
-			cfg := gmConfig.Clone()
-			cfg.ServerName = host
-			tlsConn := gmtls.Client(conn, cfg)
+			tlsConn := gmtls.Client(conn, &gmtls.Config{
+				ServerName: host,
+				// 仅跳过 gmsm 内置校验（其系统根加载不支持 macOS/Windows）；
+				// 真实证书链与主机名校验由 VerifyPeerCertificate 执行。
+				InsecureSkipVerify: true,
+				VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*gmx509.Certificate) error {
+					return verifyTLCPCerts(rawCerts, host, stdRoots)
+				},
+			})
 			if err := tlsConn.Handshake(); err != nil {
 				conn.Close()
 				return nil, err
@@ -141,6 +158,29 @@ func newGmDohResolver(url string) (*gmDohResolver, error) {
 			Timeout:   5 * time.Second,
 		},
 	}, nil
+}
+
+// verifyTLCPCerts 用标准库校验 TLCP 对端证书链与主机名（SM2/ECC/RSA 证书均可）。
+func verifyTLCPCerts(rawCerts [][]byte, dnsName string, roots *x509.CertPool) error {
+	if len(rawCerts) == 0 {
+		return fmt.Errorf("国密 DoH: 对端未提供证书")
+	}
+	leaf, err := x509.ParseCertificate(rawCerts[0])
+	if err != nil {
+		return fmt.Errorf("国密 DoH: 解析对端证书失败: %w", err)
+	}
+	intermediates := x509.NewCertPool()
+	for _, raw := range rawCerts[1:] {
+		c, err := x509.ParseCertificate(raw)
+		if err != nil {
+			return fmt.Errorf("国密 DoH: 解析中间证书失败: %w", err)
+		}
+		intermediates.AddCert(c)
+	}
+	if _, err := leaf.Verify(x509.VerifyOptions{DNSName: dnsName, Roots: roots, Intermediates: intermediates}); err != nil {
+		return fmt.Errorf("国密 DoH: 证书校验失败: %w", err)
+	}
+	return nil
 }
 
 func (h *gmDohResolver) Resolve(ctx context.Context, r *dns.Msg) (*dns.Msg, error) {

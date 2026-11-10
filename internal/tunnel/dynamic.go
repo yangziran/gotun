@@ -26,6 +26,7 @@ type DynamicTunnel struct {
 	router *router.Router
 
 	listeners []net.Listener // 本地 SOCKS5 代理监听器列表
+	tracker   connTracker    // 活动连接跟踪与 Stop/Start 排空协调
 	wg        sync.WaitGroup
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -49,16 +50,25 @@ func (t *DynamicTunnel) GetName() string {
 	return t.cfg.Name
 }
 
-// Start 启动隧道：建立本地 SOCKS5 监听，并在后台派生请求接收协程
+// Start 启动隧道：同步完成本地 SOCKS5 监听绑定，成功后在后台派生请求接收协程
 func (t *DynamicTunnel) Start(ctx context.Context) error {
 	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	if t.running {
-		t.mu.Unlock()
 		return fmt.Errorf("tunnel %s is already running", t.cfg.Name)
 	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("tunnel %s start aborted: %w", t.cfg.Name, err)
+	}
+
+	// 等待上一代 Stop 的排空完成，避免 wg.Add 与上一代 wg.Wait 并发
+	if ch := t.tracker.start(); ch != nil {
+		<-ch
+	}
+
 	t.ctx, t.cancel = context.WithCancel(ctx)
 	t.running = true
-	t.mu.Unlock()
 
 	logger.Info("正在启动动态 SOCKS5 代理...", "tunnel", t.cfg.Name)
 
@@ -73,26 +83,38 @@ func (t *DynamicTunnel) Start(ctx context.Context) error {
 		logger.Info("本地 SOCKS5 代理正在监听", "tunnel", t.cfg.Name, "local", addr, "servers", t.cfg.ServerNames)
 	}
 
-	if len(t.listeners) == 0 {
-		return fmt.Errorf("listen on local addresses failed for tunnel %s", t.cfg.Name)
+	// 绑定期间若父上下文已被取消（例如 Stop 已调用），立即清理监听器，防止泄漏
+	if err := t.ctx.Err(); err != nil || len(t.listeners) == 0 {
+		if len(t.listeners) == 0 {
+			err = fmt.Errorf("listen on local addresses failed for tunnel %s", t.cfg.Name)
+		}
+		for _, ln := range t.listeners {
+			ln.Close()
+		}
+		t.listeners = nil
+		t.running = false
+		t.cancel()
+		t.cancel = nil
+		return err
 	}
 
+	tunCtx := t.ctx
 	for _, ln := range t.listeners {
 		t.wg.Add(1)
-		go t.acceptLoop(ln)
+		go t.acceptLoop(tunCtx, ln)
 	}
 
 	return nil
 }
 
 // acceptLoop 接收 SOCKS5 客户端的连接请求
-func (t *DynamicTunnel) acceptLoop(ln net.Listener) {
+func (t *DynamicTunnel) acceptLoop(ctx context.Context, ln net.Listener) {
 	defer t.wg.Done()
 	for {
 		localConn, err := ln.Accept()
 		if err != nil {
 			select {
-			case <-t.ctx.Done():
+			case <-ctx.Done():
 				return
 			default:
 				logger.Error("接收 SOCKS5 连接失败", "tunnel", t.cfg.Name, "err", err)
@@ -107,14 +129,20 @@ func (t *DynamicTunnel) acceptLoop(ln net.Listener) {
 		}
 
 		t.wg.Add(1)
-		go t.handleConnection(localConn)
+		go t.handleConnection(ctx, localConn)
 	}
 }
 
 // handleConnection 负责处理单次 SOCKS5 会话（握手、寻址、数据转发）并融入负载均衡与指标采集
-func (t *DynamicTunnel) handleConnection(localConn net.Conn) {
+func (t *DynamicTunnel) handleConnection(ctx context.Context, localConn net.Conn) {
 	defer t.wg.Done()
 	defer localConn.Close()
+
+	// 隧道已停止时直接关闭新接入的连接，避免 Stop 后仍转发数据
+	if !t.tracker.add(localConn) {
+		return
+	}
+	defer t.tracker.remove(localConn)
 
 	if err := t.socks5Handshake(localConn); err != nil {
 		logger.Error("SOCKS5 握手失败", "tunnel", t.cfg.Name, "err", err)
@@ -159,7 +187,10 @@ func (t *DynamicTunnel) handleConnection(localConn net.Conn) {
 
 		logger.Debug("SOCKS5 寻址完成，准备派发代理", "tunnel", t.cfg.Name, "target", targetAddr, "dispatch_to", targetServer)
 
-		client, err := t.pool.GetReadyClient(t.ctx, targetServer)
+		// 限制等待节点就绪的时间，避免在无响应节点上无限阻塞
+		waitCtx, waitCancel := context.WithTimeout(ctx, pool.GetReadyTimeout)
+		defer waitCancel()
+		client, err := t.pool.GetReadyClient(waitCtx, targetServer)
 		if err != nil {
 			logger.Error("拒绝连接：SSH 连接池不可用", "tunnel", t.cfg.Name, "client", localConn.RemoteAddr(), "err", err)
 			localConn.Write([]byte{0x05, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
@@ -283,15 +314,21 @@ func (t *DynamicTunnel) Stop() {
 	if t.cancel != nil {
 		t.cancel()
 	}
+	listeners := t.listeners
+	t.listeners = nil
 	t.mu.Unlock()
 
 	logger.Info("正在停止动态隧道...", "tunnel", t.cfg.Name)
-	for _, ln := range t.listeners {
+
+	// 先关闭监听器停止 accept，再断开所有活动连接，确保旧会话被终止
+	for _, ln := range listeners {
 		ln.Close()
 	}
+	t.tracker.stop()
 
 	go func() {
 		t.wg.Wait()
-		logger.Info("动态隧道已完全停止（旧连接已排空）。", "tunnel", t.cfg.Name)
+		t.tracker.drained()
+		logger.Info("动态隧道已完全停止（旧连接已断开）。", "tunnel", t.cfg.Name)
 	}()
 }

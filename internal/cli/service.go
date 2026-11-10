@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 
 	"github.com/kardianos/service"
 	"github.com/spf13/cobra"
@@ -19,39 +20,45 @@ var (
 )
 
 type program struct {
+	mu     sync.Mutex
 	m      *manager.Manager
 	cancel context.CancelFunc
 }
 
+// Start 同步完成配置加载与 Manager 初始化，成功后才异步运行事件循环；
+// 初始化失败时返回 error，让服务管理器感知启动失败
 func (p *program) Start(s service.Service) error {
-	// Start 方法不能阻塞，所以需要开一个 goroutine 跑主逻辑
-	go p.run()
-	return nil
-}
-
-func (p *program) run() {
 	logger.Info("后台守护进程开始运行，加载配置...", "file", svcConfigPath)
 	cfg, err := config.LoadConfig(svcConfigPath)
 	if err != nil {
-		logger.Error("后台守护进程加载配置文件失败", "err", err)
-		return
+		return fmt.Errorf("后台守护进程加载配置文件失败: %w", err)
 	}
 
-	// 写入 PID 文件，供 gotun reload 命令使用
-	if err := writePID(); err != nil {
-		logger.Warn("写入 PID 文件失败，热加载命令可能无法使用", "err", err)
-	}
-	defer os.Remove(getPIDFilePath())
-
-	p.m = manager.NewManager(cfg)
 	ctx, cancel := context.WithCancel(context.Background())
-	p.cancel = cancel
-
-	if err := p.m.Start(ctx); err != nil {
-		logger.Error("后台无法启动隧道管理器", "err", err)
+	m := manager.NewManager(cfg)
+	if err := m.Start(ctx); err != nil {
 		cancel()
-		return
+		return fmt.Errorf("后台无法启动隧道管理器: %w", err)
 	}
+
+	// 写入 PID 文件，供 gotun reload 命令使用；失败（如已有实例在运行）则让服务管理器感知启动失败
+	if err := writePID(); err != nil {
+		cancel()
+		return fmt.Errorf("写入 PID 文件失败: %w", err)
+	}
+
+	p.mu.Lock()
+	p.m = m
+	p.cancel = cancel
+	p.mu.Unlock()
+
+	// 初始化已完成，事件循环异步运行，保持 Start 不阻塞
+	go p.run(ctx, m)
+	return nil
+}
+
+func (p *program) run(ctx context.Context, m *manager.Manager) {
+	defer os.Remove(getPIDFilePath())
 
 	sigCh := make(chan os.Signal, 1)
 	reloadSignals := getReloadSignals()
@@ -69,7 +76,7 @@ func (p *program) run() {
 			if err != nil {
 				logger.Error("热加载重读配置文件失败，将继续使用旧配置", "err", err)
 			} else {
-				p.m.Reload(newCfg)
+				m.Reload(newCfg)
 			}
 		}
 	}
@@ -77,11 +84,19 @@ func (p *program) run() {
 
 func (p *program) Stop(s service.Service) error {
 	logger.Info("系统发出终止信号，正在停止后台服务...")
-	if p.cancel != nil {
-		p.cancel()
+
+	p.mu.Lock()
+	cancel := p.cancel
+	m := p.m
+	p.cancel = nil
+	p.m = nil
+	p.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
 	}
-	if p.m != nil {
-		p.m.Stop()
+	if m != nil {
+		m.Stop()
 	}
 	return nil
 }

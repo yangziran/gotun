@@ -25,4 +25,10 @@ go.work.sum
 # MacOS specific
 .DS_Store
 
+/config.yaml
 configs/config.yaml
+
+# 敏感备份与临时文件，避免误提交含凭据的副本
+*.bak
+*.tmp
+configs/*.local.yaml

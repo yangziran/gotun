@@ -18,9 +18,14 @@ var reloadCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
+		if !pidAlive(pid) {
+			logger.Error("进程不存在或已退出", "pid", pid)
+			os.Exit(1)
+		}
+
 		process, err := os.FindProcess(pid)
 		if err != nil {
-			logger.Error("进程不存在", "pid", pid, "err", err)
+			logger.Error("进程查找失败", "pid", pid, "err", err)
 			os.Exit(1)
 		}
 

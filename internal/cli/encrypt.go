@@ -29,10 +29,10 @@ var encryptCmd = &cobra.Command{
 
 		if secretKey == "" {
 			secretKey = os.Getenv("GOTUN_SECRET_KEY")
-			if secretKey == "" {
-				secretKey = crypto.DefaultSecretKey
-				logger.Warn("未提供自定义密钥(-k)，也未设置环境变量，将使用内置兜底密钥进行加密")
-			}
+		}
+		if secretKey == "" {
+			logger.Error("必须提供加密密钥：使用 -k 参数或设置 GOTUN_SECRET_KEY 环境变量")
+			os.Exit(1)
 		}
 
 		ciphertext, err := crypto.Encrypt(plaintext, secretKey)
@@ -44,11 +44,11 @@ var encryptCmd = &cobra.Command{
 		fmt.Println("==================================================")
 		fmt.Printf("密文: %s\n", ciphertext)
 		fmt.Println("==================================================")
-		fmt.Println("请按照以下格式更新您的 config.yaml 对应的服务器节点：")
+		fmt.Println("请按照以下格式更新您的 configs/config.yaml 对应的服务器节点：")
 		fmt.Println("  password: \"<密文>\"")
 		fmt.Println("  encrypted: true")
-		fmt.Println("随后，如果您使用了自定义密钥，请携带密钥启动服务：")
-		fmt.Println("GOTUN_SECRET_KEY=\"<您的密钥>\" ./gotun start -c config.yaml")
+		fmt.Println("启动时必须通过 GOTUN_SECRET_KEY 提供相同密钥：")
+		fmt.Println("GOTUN_SECRET_KEY=\"<您的密钥>\" ./bin/gotun start -c configs/config.yaml")
 	},
 }
 

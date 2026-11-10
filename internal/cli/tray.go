@@ -6,6 +6,7 @@ import (
 	"context"
 	"os/exec"
 	"path/filepath"
+	"sync"
 
 	"github.com/getlantern/systray"
 	"github.com/spf13/cobra"
@@ -24,17 +25,64 @@ var trayCmd = &cobra.Command{
 			logger.Error("必须指定配置文件 (-c)")
 			return
 		}
-		systray.Run(onReady, onExit)
+		engine := &trayEngine{}
+		systray.Run(func() { onReady(engine) }, engine.stop)
 	},
 }
 
-var (
-	appManager *manager.Manager
-	appCtx     context.Context
-	appCancel  context.CancelFunc
-)
+// trayEngine 封装托盘引擎的当前实例，通过互斥锁避免快速启停时的数据竞争
+type trayEngine struct {
+	mu      sync.Mutex
+	manager *manager.Manager
+	cancel  context.CancelFunc
+}
 
-func onReady() {
+func (e *trayEngine) start() {
+	cfg, err := config.LoadConfig(trayCfgFile)
+	if err != nil {
+		logger.Error("加载配置失败", "err", err)
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m := manager.NewManager(cfg)
+
+	e.mu.Lock()
+	e.manager = m
+	e.cancel = cancel
+	e.mu.Unlock()
+
+	go func() {
+		if err := m.Start(ctx); err != nil {
+			logger.Error("引擎启动失败", "err", err)
+		}
+	}()
+}
+
+func (e *trayEngine) stop() {
+	e.mu.Lock()
+	m := e.manager
+	cancel := e.cancel
+	e.manager = nil
+	e.cancel = nil
+	e.mu.Unlock()
+
+	if m != nil {
+		m.Stop()
+	}
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// current 返回当前引擎实例的 Manager（可能为 nil）
+func (e *trayEngine) current() *manager.Manager {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.manager
+}
+
+func onReady(engine *trayEngine) {
 	systray.SetIcon(iconData)
 	systray.SetTooltip("Gotun - 极速代理引擎")
 
@@ -49,7 +97,7 @@ func onReady() {
 	quitItem := systray.AddMenuItem("退出 Gotun", "完全退出")
 
 	// 初始启动引擎
-	startEngine()
+	engine.start()
 	statusItem.SetTitle("状态: 运行中")
 
 	go func() {
@@ -58,24 +106,26 @@ func onReady() {
 			select {
 			case <-toggleItem.ClickedCh:
 				if isRunning {
-					stopEngine()
+					engine.stop()
 					toggleItem.SetTitle("启动代理")
 					statusItem.SetTitle("状态: 已停止")
 					isRunning = false
 				} else {
-					startEngine()
+					engine.start()
 					toggleItem.SetTitle("停止代理")
 					statusItem.SetTitle("状态: 运行中")
 					isRunning = true
 				}
 			case <-reloadItem.ClickedCh:
-				if isRunning && appManager != nil {
-					cfg, err := config.LoadConfig(trayCfgFile)
-					if err != nil {
-						logger.Error("配置重新加载失败", "err", err)
-					} else {
-						appManager.Reload(cfg)
-						logger.Info("状态栏触发配置热重载成功")
+				if isRunning {
+					if m := engine.current(); m != nil {
+						cfg, err := config.LoadConfig(trayCfgFile)
+						if err != nil {
+							logger.Error("配置重新加载失败", "err", err)
+						} else {
+							m.Reload(cfg)
+							logger.Info("状态栏触发配置热重载成功")
+						}
 					}
 				}
 			case <-editItem.ClickedCh:
@@ -88,35 +138,6 @@ func onReady() {
 			}
 		}
 	}()
-}
-
-func startEngine() {
-	cfg, err := config.LoadConfig(trayCfgFile)
-	if err != nil {
-		logger.Error("加载配置失败", "err", err)
-		return
-	}
-
-	appCtx, appCancel = context.WithCancel(context.Background())
-	appManager = manager.NewManager(cfg)
-	go func() {
-		if err := appManager.Start(appCtx); err != nil {
-			logger.Error("引擎启动失败", "err", err)
-		}
-	}()
-}
-
-func stopEngine() {
-	if appManager != nil {
-		appManager.Stop()
-	}
-	if appCancel != nil {
-		appCancel()
-	}
-}
-
-func onExit() {
-	stopEngine()
 }
 
 func init() {

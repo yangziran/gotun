@@ -20,6 +20,7 @@ type RemoteTunnel struct {
 	cfg  config.TunnelConfig
 	pool *pool.Pool
 
+	tracker connTracker // 活动连接跟踪与 Stop/Start 排空协调
 	wg      sync.WaitGroup
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -45,29 +46,38 @@ func (t *RemoteTunnel) GetName() string {
 // Start 启动隧道：在后台派生远端监听协程
 func (t *RemoteTunnel) Start(ctx context.Context) error {
 	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	if t.running {
-		t.mu.Unlock()
 		return fmt.Errorf("tunnel %s is already running", t.cfg.Name)
 	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("tunnel %s start aborted: %w", t.cfg.Name, err)
+	}
+
+	// 等待上一代 Stop 的排空完成，避免 wg.Add 与上一代 wg.Wait 并发
+	if ch := t.tracker.start(); ch != nil {
+		<-ch
+	}
+
 	t.ctx, t.cancel = context.WithCancel(ctx)
 	t.running = true
-	t.mu.Unlock()
 
 	logger.Info("正在启动远端反向隧道...", "tunnel", t.cfg.Name)
 
 	t.wg.Add(1)
-	go t.maintainRemoteListener()
+	go t.maintainRemoteListener(t.ctx)
 
 	return nil
 }
 
 // maintainRemoteListener 负责在可用的服务器上建立反向监听 (支持自动容灾Failover)
-func (t *RemoteTunnel) maintainRemoteListener() {
+func (t *RemoteTunnel) maintainRemoteListener(ctx context.Context) {
 	defer t.wg.Done()
 
 	for {
 		select {
-		case <-t.ctx.Done():
+		case <-ctx.Done():
 			return
 		default:
 		}
@@ -77,19 +87,21 @@ func (t *RemoteTunnel) maintainRemoteListener() {
 			return
 		}
 
-		// 轮询选取 Server 作为远端监听的主机
-		idx := atomic.AddUint64(&t.robinIndex, 1)
+		// 轮询选取 Server 作为远端监听的主机（从索引 0 开始，严格按配置顺序，不跳过首个节点）
+		idx := atomic.AddUint64(&t.robinIndex, 1) - 1
 		targetServer := t.cfg.ServerNames[idx%uint64(len(t.cfg.ServerNames))]
 
 		logger.Debug("准备在服务器建立反向监听...", "tunnel", t.cfg.Name, "server", targetServer)
 
-		// 阻塞获取可用的客户端
-		client, err := t.pool.GetReadyClient(t.ctx, targetServer)
+		// 带超时获取可用客户端：主节点长期不可用时放弃等待，Failover 到下一节点
+		waitCtx, waitCancel := context.WithTimeout(ctx, pool.GetReadyTimeout)
+		client, err := t.pool.GetReadyClient(waitCtx, targetServer)
+		waitCancel()
 		if err != nil {
-			logger.Error("获取 SSH 客户端失败，等待重试...", "tunnel", t.cfg.Name, "server", targetServer, "err", err)
+			logger.Error("获取 SSH 客户端失败，尝试下一节点...", "tunnel", t.cfg.Name, "server", targetServer, "err", err)
 			select {
 			case <-time.After(2 * time.Second):
-			case <-t.ctx.Done():
+			case <-ctx.Done():
 				return
 			}
 			continue
@@ -100,7 +112,7 @@ func (t *RemoteTunnel) maintainRemoteListener() {
 			logger.Error("无法在远端地址建立监听 (可能未开启 GatewayPorts)，将尝试下一个节点", "tunnel", t.cfg.Name, "remote_addr", t.cfg.RemoteAddr, "err", err)
 			select {
 			case <-time.After(5 * time.Second):
-			case <-t.ctx.Done():
+			case <-ctx.Done():
 				return
 			}
 			continue
@@ -109,7 +121,7 @@ func (t *RemoteTunnel) maintainRemoteListener() {
 		logger.Info("远端反向隧道已成功开启监听", "tunnel", t.cfg.Name, "server", targetServer, "remote_addr", t.cfg.RemoteAddr, "local_target", t.cfg.LocalAddr)
 
 		// 为这单次监听分配特定的上下文
-		sessionCtx, sessionCancel := context.WithCancel(t.ctx)
+		sessionCtx, sessionCancel := context.WithCancel(ctx)
 
 		go func() {
 			<-sessionCtx.Done()
@@ -130,7 +142,7 @@ func (t *RemoteTunnel) maintainRemoteListener() {
 		logger.Warn("远端监听意外终止，准备重试容灾节点...", "tunnel", t.cfg.Name)
 		select {
 		case <-time.After(2 * time.Second):
-		case <-t.ctx.Done():
+		case <-ctx.Done():
 			return
 		}
 	}
@@ -167,6 +179,12 @@ func (t *RemoteTunnel) remoteAcceptLoop(ctx context.Context, ln net.Listener, wg
 // handleConnection 处理一条来自远端的连接，将其导向本地目标地址，并融入 Metrics
 func (t *RemoteTunnel) handleConnection(remoteConn net.Conn) {
 	defer remoteConn.Close()
+
+	// 隧道已停止时直接关闭新接入的连接，避免 Stop 后仍转发数据
+	if !t.tracker.add(remoteConn) {
+		return
+	}
+	defer t.tracker.remove(remoteConn)
 
 	logger.Debug("已接收新的远端反向连接", "tunnel", t.cfg.Name, "client", remoteConn.RemoteAddr())
 
@@ -220,8 +238,14 @@ func (t *RemoteTunnel) Stop() {
 
 	logger.Info("正在停止隧道...", "tunnel", t.cfg.Name)
 
+	// 断开所有活动连接：remoteAcceptLoop 中的 connWg.Wait 依赖此处关闭才能退出，避免 goroutine 泄漏
+	t.tracker.stop()
+
+	// 异步等待监听协程退出；下一次 Start 会通过 tracker 等待本次排空完成，
+	// 避免 wg.Add 与未返回的 wg.Wait 并发触发 "WaitGroup is reused before previous Wait has returned" panic。
 	go func() {
 		t.wg.Wait()
-		logger.Info("远端反向隧道已完全停止（旧连接已排空）。", "tunnel", t.cfg.Name)
+		t.tracker.drained()
+		logger.Info("远端反向隧道已完全停止（旧连接已断开）。", "tunnel", t.cfg.Name)
 	}()
 }

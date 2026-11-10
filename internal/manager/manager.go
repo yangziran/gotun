@@ -48,7 +48,11 @@ func (m *Manager) Start(ctx context.Context) error {
 
 	// 启动 DNS 服务器
 	if m.cfg.DNS.Enable {
-		m.dnsSrv = dns.NewServer(m.cfg.DNS, m.router)
+		srv, err := dns.NewServer(m.cfg.DNS, m.router)
+		if err != nil {
+			return fmt.Errorf("初始化 DNS 服务器失败: %w", err)
+		}
+		m.dnsSrv = srv
 		if err := m.dnsSrv.Start(m.ctx); err != nil {
 			logger.Error("DNS 服务器启动失败", "err", err)
 		}
@@ -85,12 +89,12 @@ func (m *Manager) startTunnels(tunnelsCfg []config.TunnelConfig) {
 		m.tunnels[tunCfg.Name] = t
 		m.tunnelConfigs[tunCfg.Name] = tunCfg
 
-		go func(tun tunnel.Tunnel, name string) {
-			err := tun.Start(m.ctx)
-			if err != nil {
-				logger.Error("隧道启动失败", "tunnel", name, "err", err)
-			}
-		}(t, tunCfg.Name)
+		// 同步完成监听器绑定与状态发布，避免 Stop 在 Start 生效前执行导致监听器泄漏
+		if err := t.Start(m.ctx); err != nil {
+			logger.Error("隧道启动失败", "tunnel", tunCfg.Name, "err", err)
+			delete(m.tunnels, tunCfg.Name)
+			delete(m.tunnelConfigs, tunCfg.Name)
+		}
 	}
 	logger.Info(fmt.Sprintf("当前正在运行 %d 条隧道", len(m.tunnels)))
 }
@@ -119,9 +123,14 @@ func (m *Manager) Reload(newCfg *config.Config) {
 			m.dnsSrv = nil
 		}
 		if m.cfg.DNS.Enable {
-			m.dnsSrv = dns.NewServer(m.cfg.DNS, m.router)
-			if err := m.dnsSrv.Start(m.ctx); err != nil {
-				logger.Error("DNS 服务器热加载启动失败", "err", err)
+			srv, err := dns.NewServer(m.cfg.DNS, m.router)
+			if err != nil {
+				logger.Error("DNS 服务器初始化失败，热加载将不启用 DNS", "err", err)
+			} else {
+				m.dnsSrv = srv
+				if err := m.dnsSrv.Start(m.ctx); err != nil {
+					logger.Error("DNS 服务器热加载启动失败", "err", err)
+				}
 			}
 		}
 	}

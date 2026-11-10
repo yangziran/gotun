@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/yangziran/gotun/internal/config"
+	"github.com/yangziran/gotun/internal/hostkey"
 	"github.com/yangziran/gotun/internal/metrics"
 	"github.com/yangziran/gotun/pkg/logger"
 	"github.com/yangziran/gotun/pkg/utils"
@@ -116,11 +117,45 @@ func (c *Client) maintainConnection() {
 	}
 }
 
+// ctxConn 包装 net.Conn，在 ctx 被取消时关闭底层连接，
+// 使阻塞中的 SSH 握手（ssh.NewClientConn）能够被中断返回错误。
+// 握手成功后必须调用 release 解除监听，避免误关正常连接。
+type ctxConn struct {
+	net.Conn
+	mu       sync.Mutex
+	released bool
+}
+
+func newCtxConn(ctx context.Context, conn net.Conn) *ctxConn {
+	cc := &ctxConn{Conn: conn}
+	go func() {
+		<-ctx.Done()
+		cc.mu.Lock()
+		released := cc.released
+		cc.mu.Unlock()
+		if !released {
+			conn.Close()
+		}
+	}()
+	return cc
+}
+
+func (cc *ctxConn) release() {
+	cc.mu.Lock()
+	cc.released = true
+	cc.mu.Unlock()
+}
+
 func (c *Client) dial() (*ssh.Client, error) {
+	verifier, err := hostkey.NewVerifier(c.srvCfg.Host, c.srvCfg.Port, c.srvCfg.HostKey)
+	if err != nil {
+		return nil, fmt.Errorf("初始化主机密钥校验失败: %w", err)
+	}
+
 	sshConfig := &ssh.ClientConfig{
 		User:            c.srvCfg.User,
 		Auth:            []ssh.AuthMethod{},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: verifier.Callback, // TOFU：跳板与最终节点各自独立校验
 		Timeout:         10 * time.Second,
 	}
 
@@ -158,11 +193,14 @@ func (c *Client) dial() (*ssh.Client, error) {
 			return nil, fmt.Errorf("通过堡垒机拨号失败: %w", err)
 		}
 
-		ncc, chans, reqs, err := ssh.NewClientConn(conn, targetAddr, sshConfig)
+		cc := newCtxConn(c.ctx, conn)
+		ncc, chans, reqs, err := ssh.NewClientConn(cc, targetAddr, sshConfig)
 		if err != nil {
+			cc.release()
 			conn.Close()
 			return nil, err
 		}
+		cc.release()
 		return ssh.NewClient(ncc, chans, reqs), nil
 	}
 
@@ -178,16 +216,29 @@ func (c *Client) dial() (*ssh.Client, error) {
 		tcpConn.SetWriteBuffer(4 * 1024 * 1024)
 	}
 
-	ncc, chans, reqs, err := ssh.NewClientConn(conn, targetAddr, sshConfig)
+	cc := newCtxConn(c.ctx, conn)
+	ncc, chans, reqs, err := ssh.NewClientConn(cc, targetAddr, sshConfig)
 	if err != nil {
+		cc.release()
 		conn.Close()
 		return nil, err
 	}
+	cc.release()
 	return ssh.NewClient(ncc, chans, reqs), nil
 }
 
 func (c *Client) keepAlive(client *ssh.Client) {
-	ticker := time.NewTicker(15 * time.Second)
+	c.runKeepAlive(func() error {
+		_, _, err := client.SendRequest("keepalive@gotun", true, nil)
+		return err
+	}, 15*time.Second, 10*time.Second)
+}
+
+// runKeepAlive 周期性执行心跳探测，回包阻塞超过 timeout 视为一次 missed；
+// 连续 3 次 missed 判定连接假死并返回（由调用方重建连接）。
+// 滞留的探测 goroutine 通过缓冲 channel 无损退出，不会阻塞泄漏。
+func (c *Client) runKeepAlive(send func() error, interval, timeout time.Duration) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	missed := 0
@@ -196,15 +247,30 @@ func (c *Client) keepAlive(client *ssh.Client) {
 		case <-c.ctx.Done():
 			return
 		case <-ticker.C:
-			_, _, err := client.SendRequest("keepalive@gotun", true, nil)
-			if err != nil {
+			done := make(chan error, 1)
+			go func() {
+				done <- send()
+			}()
+
+			select {
+			case <-c.ctx.Done():
+				return
+			case err := <-done:
+				if err != nil {
+					missed++
+					if missed >= 3 {
+						logger.Warn("SSH 心跳丢失超限，断开连接", "server", c.srvCfg.Name)
+						return
+					}
+				} else {
+					missed = 0
+				}
+			case <-time.After(timeout):
 				missed++
 				if missed >= 3 {
-					logger.Warn("SSH 心跳丢失超限，断开连接", "server", c.srvCfg.Name)
+					logger.Warn("SSH 心跳超时次数超限，断开连接", "server", c.srvCfg.Name)
 					return
 				}
-			} else {
-				missed = 0
 			}
 		}
 	}

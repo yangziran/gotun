@@ -31,9 +31,10 @@ var startCmd = &cobra.Command{
 
 		logger.Info("成功加载配置", "servers", len(cfg.Servers), "tunnels", len(cfg.Tunnels))
 
-		// 写入 PID 文件，供 gotun reload 命令使用
+		// 写入 PID 文件，供 gotun reload 命令使用；失败（如已有实例在运行）则终止启动
 		if err := writePID(); err != nil {
-			logger.Warn("写入 PID 文件失败，热加载命令可能无法使用", "err", err)
+			logger.Error("写入 PID 文件失败，终止启动", "err", err)
+			os.Exit(1)
 		}
 		defer os.Remove(getPIDFilePath())
 

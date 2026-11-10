@@ -26,6 +26,10 @@ jobs:
             goos: linux
             goarch: amd64
             artifact_name: gotun_linux_amd64
+          - os: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            artifact_name: gotun_linux_arm64
           - os: windows-latest
             goos: windows
             goarch: amd64
@@ -45,7 +49,7 @@ jobs:
         run: |
           mkdir -p bin
           # macOS 需要 CGO 以支持原生状态栏 (Systray/Cocoa)
-          # Linux 与 Windows 采用无头模式 (Headless)，关闭 CGO 产出纯静态二进制
+          # Linux 使用无头模式（Headless）；Windows 走纯 Go 路径（x/sys/windows），无需 CGO，托盘功能保留
           if [ "${{ runner.os }}" = "macOS" ]; then
             export CGO_ENABLED=1
           else
@@ -55,7 +59,7 @@ jobs:
           export GOOS=${{ matrix.goos }}
           export GOARCH=${{ matrix.goarch }}
           
-          go build -trimpath -ldflags="-s -w" -o bin/${{ matrix.artifact_name }} ./cmd/gotun
+          go build -trimpath -ldflags="-s -w -X github.com/yangziran/gotun/internal/cli.Version=${{ github.ref_name }}" -o bin/${{ matrix.artifact_name }} ./cmd/gotun
 
       - name: Upload Release Asset
         uses: softprops/action-gh-release@v2

@@ -10,9 +10,6 @@ import (
 	"io"
 )
 
-// DefaultSecretKey 是当用户未提供 GOTUN_SECRET_KEY 时的兜底内置密钥，用于基础的代码级混淆防护
-const DefaultSecretKey = "gotun_default_fallback_secret_key_v1"
-
 // deriveKey 使用 SHA256 将任意长度的密码转换为 32 字节的 AES-256 密钥
 func deriveKey(secret string) []byte {
 	hash := sha256.Sum256([]byte(secret))

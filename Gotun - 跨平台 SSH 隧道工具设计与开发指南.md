@@ -7,7 +7,7 @@
 ## 一、 项目概述
 
 - **项目名称**：gotun
-- **开发语言**：Go 1.20+
+- **开发语言**：Go 1.26.2+
 - **核心依赖**：`golang.org/x/crypto/ssh`, `github.com/spf13/cobra`, `github.com/kardianos/service`, `github.com/prometheus/client_golang`, `github.com/getlantern/systray`
 - **目标平台**：macOS / Linux / Windows
 - **核心定位**：一个轻量级、高可用、支持声明式配置的跨平台企业级 SSH 隧道与边缘网络网关工具。解决开发者日常工作中频繁维护 SSH 端口转发的痛点，提供零停机热加载、多路并发复用、内置智能分流路由、极速防污染 DNS 以及全链路双栈 IPv6 原生架构。
@@ -17,8 +17,6 @@
 ## 二、 系统架构设计
 
 ### 2.1 模块依赖关系
-
-系统采用自定向下的分层架构，底层网络与业务层完全解耦，确保代码的高内聚与低耦合。
 
 系统采用自定向下的分层架构，底层网络与业务层完全解耦，确保代码的高内聚与低耦合。
 
@@ -112,8 +110,9 @@ type DNSConfig struct {
 }
 
 type RoutingConfig struct {
-    Mode      string `yaml:"mode"`       // "global" 或 "pac"
-    BypassLan bool   `yaml:"bypass_lan"` // 是否绕过局域网
+    Mode         string `yaml:"mode"`          // "global" / "direct" / "pac"
+    BypassLAN    bool   `yaml:"bypass_lan"`    // 是否绕过局域网
+    ChnroutesURL string `yaml:"chnroutes_url"` // pac 模式下 chnroutes 的下载地址
 }
 
 type ServerConfig struct {
@@ -125,6 +124,7 @@ type ServerConfig struct {
     KeyPath   string `yaml:"key_path,omitempty"`
     JumpHost  string `yaml:"jump_host,omitempty"`
     PoolSize  int    `yaml:"pool_size,omitempty"` // 并发连接池大小
+    HostKey   string `yaml:"host_key,omitempty"`  // 预置主机密钥 SHA256 指纹
     Encrypted bool   `yaml:"encrypted"`
 }
 
@@ -166,7 +166,7 @@ type Tunnel interface {
 
 **实现逻辑**：Tunnel 纯粹作为“业务请求分发器”。监听本地请求 -> 经过**智能路由引擎**判定 -> 触发时向 ServerPool 获取 `ssh.Client` -> 申请 Channel -> 拷贝流量。
 
-- **内置智能路由 (Smart Routing)**：原生内嵌基于 `netip` 的毫秒级国内/局域网分流引擎，支持 `global`（全局代理）与 `pac`（绕过国内大陆 IP 与局域网）模式。异步加载 `chnroutes2`，实现按需分流，不浪费一滴机场流量。
+- **内置智能路由 (Smart Routing)**：原生内嵌基于 `netip` 的毫秒级国内/局域网分流引擎，支持 `global`（全局代理）、`direct`（全部直连）与 `pac`（绕过国内大陆 IP 与局域网）模式。异步加载 `chnroutes2`，实现按需分流，不浪费一滴机场流量。
 
 - **轮询负载均衡 (Round-Robin)**：当配置了多个 `ServerNames` 时，Tunnel 会自动轮询申请 Client，将并发压力分散到多个远端。
 - **128KB 高吞吐零拷贝缓冲池 (Streaming Optimization)**：为了彻底解决流媒体 (如 YouTube 4K) 在起步阶段瞬间拉取大数据包导致的 GC 停顿与 CPU 飙升问题，我们在底层 (`internal/tunnel/buffer.go`) 设计了基于 `sync.Pool` 的全局 128KB 巨大内存池。所有的 `io.Copy` 均被重构为 `io.CopyBuffer`。由于连接之间完美复用了这块巨大的内存，Gotun 实现了在极高并发吞吐下的 **Zero Allocation (零内存分配)**。
@@ -237,3 +237,8 @@ make clean         # 清理 bin 目录
   - **极速防污染 DNS**：内置基于 `miekg/dns` 的透明缓存解析器。使用 Strategy 模式原生支持 UDP、DoT、DoH 协议上游。
   - **国密 TLCP 劫持**：引入 `tjfoc/gmsm`，在 HTTP 传输层接管握手，提供符合商密标准的国密 DoH 客户端能力。
   - **全链路原生 IPv6**：底层弃用脆弱单栈监听，智能根据宿主机地址裂变并发侦听双栈端口。彻底根除因 `too many colons` 导致的 IPv6-Only 节点拨号崩溃。
+
+- **[x] v1.2.0**：(主机身份与密钥安全强化)
+  - **TOFU 主机密钥校验**：通过 known_hosts 持久化信任记录，检测主机密钥变更，并支持预置 `host_key` 指纹用于无人值守部署。
+  - **移除内置兜底密钥**：密文密码不再使用内置密钥解密。
+  - **强制显式密钥**：`gotun encrypt` 必须通过 `-k` 参数或 `GOTUN_SECRET_KEY` 环境变量提供密钥，启动解密必须通过 `GOTUN_SECRET_KEY` 提供相同密钥。

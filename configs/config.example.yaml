@@ -1,5 +1,5 @@
 # ==========================================
-# Gotun v1.1.0 企业级核心配置文件示例
+# Gotun v1.2.0 企业级核心配置文件示例
 # 极速边缘网关、原生桌面状态栏、智能分流、双栈 IPv6 与极速 DNS 缓存
 # ==========================================
 
@@ -8,8 +8,9 @@
 # 专为跨境与复杂内网设计，避免流量浪费与死循环。
 # ------------------------------------------
 routing:
-  mode: "pac"          # 模式: "global" (全部代理) 或 "pac" (绕过国内局域网与大陆 IP)
+  mode: "pac"          # 模式: "global" (全部代理)、"direct" (全部直连) 或 "pac" (绕过国内局域网与大陆 IP)
   bypass_lan: true     # 是否强制绕过局域网直连 (极度建议开启，防止局域网死循环)
+  # chnroutes_url: ""  # 仅 pac 模式使用；留空使用默认下载地址
 
 # ------------------------------------------
 # [可选] Prometheus 监控探针
@@ -44,8 +45,9 @@ servers:
     port: 22                     # SSH 端口号
     user: "root"                 # SSH 登录用户名
     password: "your_password"    # 密码认证 (也可以用 key_path: "~/.ssh/id_rsa")
-    encrypted: false             # 若为密文密码请设为 true，结合 gotun encrypt 命令
+    encrypted: false             # 若为密文密码请设为 true，结合 gotun encrypt 命令（须通过 GOTUN_SECRET_KEY 提供密钥）
     pool_size: 8                 # 【极速特性】开启 8 条并发连接，打破高延迟弱网单通道队头阻塞，推荐跨境流媒体拉满 8-16
+    # host_key: "SHA256:xxxx"    # 【TOFU】预置主机密钥指纹（无人值守/服务部署用，可用 ssh-keyscan 获取）
     
   - name: "jump_server"
     host: "100.20.0.1"

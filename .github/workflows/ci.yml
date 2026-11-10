@@ -1,0 +1,54 @@
+name: CI
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  # 主验证：Linux 上做 vet / 测试 / 构建，保证跨平台核心逻辑正确
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+      - name: Build
+        run: go build ./...
+
+  # macOS：验证 CGO 开启下的 systray（原生状态栏）可编译
+  macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+      - name: Build (CGO 开启，验证 systray)
+        run: go build ./...
+
+  # Windows：验证 Windows 目标可编译（含内部 Windows 专属代码路径）。
+  # CGO_ENABLED=0 走 x/sys/windows 纯 Go 路径，与 release.yml 交叉编译保持一致。
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+      - name: Vet
+        run: go vet ./...
+      - name: Build
+        run: go build ./...
+        env:
+          CGO_ENABLED: '0'

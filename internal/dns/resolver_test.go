@@ -2,10 +2,78 @@ package dns
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"math/big"
 	"testing"
+	"time"
 
 	"github.com/miekg/dns"
 )
+
+// 生成一张自签名 ECDSA 测试证书（离线，不联网）
+func makeSelfSignedCert(t *testing.T, dnsName string) (*x509.Certificate, []byte) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("生成密钥失败: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: dnsName},
+		DNSNames:              []string{dnsName},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("签发证书失败: %v", err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("解析证书失败: %v", err)
+	}
+	return cert, der
+}
+
+// 阶段 B2 回归测试：TLCP 证书校验必须是真实校验（链 + 主机名），不得静默放行。
+func TestVerifyTLCPCerts(t *testing.T) {
+	cert, der := makeSelfSignedCert(t, "sm2.doh.pub")
+
+	trustingRoots := x509.NewCertPool()
+	trustingRoots.AddCert(cert)
+
+	t.Run("信任根内且主机名匹配则通过", func(t *testing.T) {
+		if err := verifyTLCPCerts([][]byte{der}, "sm2.doh.pub", trustingRoots); err != nil {
+			t.Fatalf("期望通过，实际: %v", err)
+		}
+	})
+
+	t.Run("主机名不匹配则拒绝", func(t *testing.T) {
+		if err := verifyTLCPCerts([][]byte{der}, "evil.example.com", trustingRoots); err == nil {
+			t.Fatal("期望因主机名不匹配被拒绝，实际放行")
+		}
+	})
+
+	t.Run("不在信任根内则拒绝", func(t *testing.T) {
+		if err := verifyTLCPCerts([][]byte{der}, "sm2.doh.pub", x509.NewCertPool()); err == nil {
+			t.Fatal("期望因不受信任被拒绝，实际放行")
+		}
+	})
+
+	t.Run("对端未提供证书则拒绝", func(t *testing.T) {
+		if err := verifyTLCPCerts(nil, "sm2.doh.pub", trustingRoots); err == nil {
+			t.Fatal("期望因无证书被拒绝，实际放行")
+		}
+	})
+}
 
 func createDNSQuery(domain string, qtype uint16) *dns.Msg {
 	m := new(dns.Msg)
