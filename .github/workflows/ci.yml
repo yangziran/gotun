@@ -5,9 +5,13 @@ on:
   pull_request:
 
 jobs:
-  # 主验证：Linux 上做 vet / 测试 / 构建，保证跨平台核心逻辑正确
+  # 主验证：Linux 上做 vet / 测试 / 构建，保证跨平台核心逻辑正确。
+  # 显式 CGO_ENABLED=0：与 release.yml 的 Linux 无头构建一致，避免 systray
+  # 的 CGO 分支依赖 libayatana-appindicator3 头文件（runner 未安装会 vet 失败）。
   linux:
     runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: '0'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
