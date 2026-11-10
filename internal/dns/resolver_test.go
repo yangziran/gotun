@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"math/big"
+	"os"
 	"testing"
 	"time"
 
@@ -83,6 +84,11 @@ func createDNSQuery(domain string, qtype uint16) *dns.Msg {
 }
 
 func TestResolvers(t *testing.T) {
+	// 依赖真实公网上游（国内 DoH/DoT/国密服务），CI 海外 runner 不可达。
+	// 默认跳过；本地验证连通性时显式开启：GOTUN_E2E=1 go test ./internal/dns/
+	if os.Getenv("GOTUN_E2E") == "" {
+		t.Skip("跳过公网上游连通性测试（设置 GOTUN_E2E=1 启用）")
+	}
 	tests := []struct {
 		name     string
 		upstream string
